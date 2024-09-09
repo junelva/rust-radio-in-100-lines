@@ -12,7 +12,7 @@ use tokio::sync::{
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let stream_url = "https://stream.epic-piano.com/chillout-piano?ref=radiobrowser";
+    let stream_url = "";
     stream_radio(stream_url).await?;
     Ok(())
 }
@@ -24,7 +24,6 @@ async fn play_buffer(
     let b = {
         let mut b = Vec::new();
         let head_len = buffer.len() - ((buffer.len()) % 4);
-        println!("buf len: {}, head len: {}", buffer.len(), head_len);
         let head: Vec<Bytes> = buffer.drain(0..head_len).collect();
         for byte in head.iter() {
             b = [b, byte.to_vec()].concat();
@@ -34,7 +33,6 @@ async fn play_buffer(
     let cursor = Cursor::new(b);
     let source = Decoder::new(cursor)?;
     sink.append(source);
-    // }
 
     Ok(())
 }
@@ -78,7 +76,7 @@ async fn stream_radio(url: &str) -> Result<(), Box<dyn Error>> {
     let sink_mtx_decode = sink_mtx.clone();
 
     // set up thread communication
-    let (mut tx, rx) = mpsc::channel::<Bytes>(4096);
+    let (mut tx, rx) = mpsc::channel::<Bytes>(128);
     let rx_mtx = Mutex::new(rx);
 
     // buffer is only touched in the decoding and playback thread
@@ -89,9 +87,7 @@ async fn stream_radio(url: &str) -> Result<(), Box<dyn Error>> {
         loop {
             let st = audio_stream.next().await;
             match download_ok(st, &mut tx).await {
-                Ok(DownloadResult::Success) => {
-                    // println!("downloaded something");
-                }
+                Ok(DownloadResult::Success) => {}
                 Ok(DownloadResult::Empty) => {
                     println!("download was empty");
                 }
@@ -99,7 +95,7 @@ async fn stream_radio(url: &str) -> Result<(), Box<dyn Error>> {
                     eprintln!("error reading chunk: {}", e);
                 }
             }
-            sleep(Duration::from_nanos(250_000));
+            sleep(Duration::from_millis(1));
         }
     });
 
@@ -115,15 +111,14 @@ async fn stream_radio(url: &str) -> Result<(), Box<dyn Error>> {
                 }
             }
 
-            if buffer.len() >= 16 {
+            if buffer.len() >= 4 {
                 let sink = sink_mtx_decode.lock().await;
                 match play_buffer(&sink, &mut buffer).await {
                     Ok(_) => (),
                     Err(e) => eprintln!("error playing: {}", e),
                 };
-            } else if buffer.is_empty() {
-                println!("empty buffer; decoder is sleeping...");
-                sleep(Duration::from_millis(1));
+            } else {
+                sleep(Duration::from_millis(5));
             }
         }
     });
