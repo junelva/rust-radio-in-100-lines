@@ -1,0 +1,12 @@
+[package]
+name = "radiobrowser-anathema"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1.40.0", features = ["full"] }
+reqwest = { version = "0.12.7", features = ["json", "stream"] }
+futures-util = "0.3.30"
+minimp3 = { git = "https://github.com/junelva/minimp3-rs/" }
+# symphonia = "0.5.4"
+rodio = { version = "0.19.0" }
