@@ -1,12 +1,11 @@
 [package]
-name = "radiobrowser-anathema"
+name = "rust-radio-in-100-lines"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-tokio = { version = "1.40.0", features = ["full"] }
-reqwest = { version = "0.12.7", features = ["json", "stream"] }
+rodio = { version = "0.19.0", default-features = false, features = ["symphonia-mp3"] }
+tokio = { version = "1.40.0", features = ["rt", "macros", "rt-multi-thread"] }
+reqwest = { version = "0.12.7", features = ["stream"] }
 futures-util = "0.3.30"
-rodio = { version = "0.19.0" }
-minimp3 = { git = "https://github.com/junelva/minimp3-rs" }
-bytes = "1.7.1"
+ringbuf = "0.4.4"

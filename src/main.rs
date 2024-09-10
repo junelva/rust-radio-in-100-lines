@@ -1,129 +1,99 @@
-use bytes::Bytes;
 use futures_util::StreamExt;
 use reqwest::Client;
+use ringbuf::{traits::*, SharedRb};
 use rodio::{Decoder, OutputStream, Sink};
-use std::thread::sleep;
-use std::time::Duration;
 use std::{error::Error, io::Cursor, sync::Arc};
-use tokio::sync::{
-    mpsc::{self, Sender},
-    Mutex,
-};
+use tokio::sync::{Mutex, Notify};
+
+const BUFFER_SIZE: usize = 1024 * 512;
+const BUFFER_ALMOST_FULL: usize = BUFFER_SIZE - BUFFER_SIZE / 4;
+const RUNTIME_READ_SIZE: usize = BUFFER_SIZE / 2;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let stream_url = "";
-    stream_radio(stream_url).await?;
-    Ok(())
-}
-
-async fn play_buffer(
-    sink: &Sink,
-    buffer: &mut Vec<Bytes>,
-) -> Result<(), rodio::decoder::DecoderError> {
-    let b = {
-        let mut b = Vec::new();
-        let head_len = buffer.len() - ((buffer.len()) % 4);
-        let head: Vec<Bytes> = buffer.drain(0..head_len).collect();
-        for byte in head.iter() {
-            b = [b, byte.to_vec()].concat();
-        }
-        b
-    };
-    let cursor = Cursor::new(b);
-    let source = Decoder::new(cursor)?;
-    sink.append(source);
-
-    Ok(())
-}
-
-enum DownloadResult {
-    Success,
-    Empty,
-}
-
-async fn download_ok(
-    sent: Option<Result<Bytes, reqwest::Error>>,
-    tx: &mut Sender<Bytes>,
-) -> Result<DownloadResult, Box<dyn Error>> {
-    match sent {
-        Some(Ok(chunk)) => {
-            tx.send(chunk).await?;
-            return Ok(DownloadResult::Success);
-        }
-        Some(Err(e)) => {
-            eprintln!("error reading chunk: {}", e);
-            return Err(Box::new(e));
-        }
-        None => (),
-    }
-    Ok(DownloadResult::Empty)
-}
-
-async fn stream_radio(url: &str) -> Result<(), Box<dyn Error>> {
-    // send an asynchronous request to the radio stream
+    let stream_url = "http://jking.cdnstream1.com/b22139_128mp3";
     let response = Client::new()
-        .get(url)
+        .get(stream_url)
         .send()
         .await
-        .or(Err(format!("failed GET from '{}'", &url)))?;
+        .or(Err(format!("failed GET from '{}'", &stream_url)))?;
     let mut audio_stream = response.bytes_stream();
 
-    // set up audio output
     let (_output_stream, output_stream_handle) = OutputStream::try_default().unwrap();
     let sink = Sink::try_new(&output_stream_handle).unwrap();
     let sink_mtx = Arc::new(Mutex::new(sink));
     let sink_mtx_decode = sink_mtx.clone();
 
-    // set up thread communication
-    let (mut tx, rx) = mpsc::channel::<Bytes>(128);
-    let rx_mtx = Mutex::new(rx);
+    let rb = SharedRb::new(BUFFER_SIZE);
+    let (mut writer, mut reader) = rb.split();
+    let write_notify = Arc::new(Notify::new());
+    let read_notify = write_notify.clone();
+    let read_size = Arc::new(Mutex::new(BUFFER_ALMOST_FULL));
+    let mut initializing_playback = true;
 
-    // buffer is only touched in the decoding and playback thread
-    let buffer = Arc::new(Mutex::new(Vec::<Bytes>::new()));
-
-    // downloading thread (sender)
     let download_handle = tokio::spawn(async move {
-        loop {
-            let st = audio_stream.next().await;
-            match download_ok(st, &mut tx).await {
-                Ok(DownloadResult::Success) => {}
-                Ok(DownloadResult::Empty) => {
-                    println!("download was empty");
-                }
-                Err(e) => {
-                    eprintln!("error reading chunk: {}", e);
+        println!("buffering...");
+        while let Some(Ok(chunk)) = audio_stream.next().await {
+            for byte in chunk {
+                loop {
+                    if writer.occupied_len() >= BUFFER_ALMOST_FULL {
+                        println!("writer is almost full, waking up decoder");
+                        initializing_playback = false;
+                        write_notify.notify_one();
+                        write_notify.notified().await;
+                        continue;
+                    }
+                    match writer.try_push(byte) {
+                        Ok(_) => break,
+                        Err(e) => eprintln!("error writing byte: {}", e),
+                    };
                 }
             }
-            sleep(Duration::from_millis(1));
+            if !initializing_playback && writer.occupied_len() >= RUNTIME_READ_SIZE {
+                write_notify.notify_one();
+                write_notify.notified().await;
+            }
         }
     });
 
-    // decoding and playback thread (receiver)
     let decode_handle = tokio::spawn(async move {
         loop {
-            let mut buffer = buffer.lock().await;
-            {
-                let mut rx = rx_mtx.lock().await;
-                let recv = rx.recv().await;
-                if let Some(recv) = recv {
-                    buffer.push(recv);
+            read_notify.notified().await;
+            print!("reading... ");
+            let out_buffer = {
+                let read_size = read_size.lock().await;
+                let mut out_buffer: Vec<u8> = Vec::with_capacity(*read_size);
+                while out_buffer.len() < *read_size {
+                    match reader.try_pop() {
+                        Some(value) => out_buffer.push(value),
+                        None => continue,
+                    }
                 }
+                out_buffer
+            };
+            print!("decoding 32 x {}; ", out_buffer.len() as f32 / 4.0);
+            let sink_mtx_decode = sink_mtx_decode.clone();
+            let cursor = Cursor::new(out_buffer);
+            let decoder = Decoder::new_mp3(cursor);
+            match decoder {
+                Ok(source) => {
+                    println!("appending to output sink");
+                    let sink = sink_mtx_decode.lock().await;
+                    if sink.empty() {
+                        println!("sink was empty; filling it up");
+                        let mut read_size = read_size.lock().await;
+                        *read_size = RUNTIME_READ_SIZE;
+                    }
+                    sink.append(source)
+                }
+                Err(e) => eprintln!("error playing: {}", e),
             }
-
-            if buffer.len() >= 4 {
-                let sink = sink_mtx_decode.lock().await;
-                match play_buffer(&sink, &mut buffer).await {
-                    Ok(_) => (),
-                    Err(e) => eprintln!("error playing: {}", e),
-                };
-            } else {
-                sleep(Duration::from_millis(5));
-            }
+            read_notify.notify_one();
         }
     });
 
-    let _ = tokio::join!(download_handle, decode_handle);
+    decode_handle.await?;
+    download_handle.await?;
     let sink = sink_mtx.lock().await;
     sink.stop();
     Ok(())
